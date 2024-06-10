@@ -12,7 +12,7 @@ ${LIB} : ${OBJS}
 
 ${SLIB}: ${OBJS}
 
-dynamic: CFLAGS += -DDYNAMIC
+dynamic: CFLAGS += -DDYNAMIC -g
 dynamic: ${LIB}
 
 static: ${SLIB}
