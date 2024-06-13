@@ -60,6 +60,16 @@ static void init_pools(void) {
     /* Espace d'environ 4 Go qui sépare la liste des metadata à la data pool */
 }
 
+// metadata *find_metadata_waiting(metadata *m)
+// {
+//     if(topchunk_pool->free_metadata != NULL)
+//     {
+//         metadata *tmp = topchunk_pool->free_metadata;
+//         while(tmp != m){tmp = tmp->next;}
+//         return tmp;
+//     }
+// }
+
 size_t *verify_freed_block(size_t size)
 {
     if(topchunk_pool->number_of_elements_freed == 0) return NULL;
@@ -77,30 +87,29 @@ size_t *verify_freed_block(size_t size)
                 {
                     /* Le bloc trouvé a une taille supérieure à la taille demandée : fragmentation du bloc */
                     metadata *new_one;
+                    /* Priorité aux meta qui attendent */
+                    if(topchunk_pool->free_metadata != NULL)
+                    {
+                        new_one = topchunk_pool->free_metadata;
+                        if(new_one->next_waiting == NULL)
+                        {
+                            topchunk_pool->free_metadata = NULL;
+                        }
+                        else
+                        {
+                            topchunk_pool->free_metadata = new_one->next_waiting;
+                        }
+                    }
+                    else
+                    {
+                        new_one = (metadata*)((size_t)current_meta + ALIGN(sizeof(current_meta)));
+                    }
                     size_t remaining_size = current_meta->size_of_chunk - (size + ALIGN(sizeof(void*)));
                     if(current_meta->next == NULL)
                     {
                         /* On a trouvé le dernier bloc de la liste */
                         if(remaining_size >= size + ALIGN(sizeof(size_t)))
                         {
-                            /* Il y a de la place pour un autre bloc */
-                            if(topchunk_pool->free_metadata == NULL)
-                            {
-                                /* Liste des metadata non utilisés vide */
-                                new_one = (metadata*)((size_t)current_meta + ALIGN(sizeof(current_meta)));
-                            }
-                            else
-                            {
-                                new_one = topchunk_pool->free_metadata;
-                                if(new_one->next == NULL)
-                                {
-                                    topchunk_pool->free_metadata = NULL;
-                                }
-                                else
-                                {
-                                    topchunk_pool->free_metadata = new_one->next;
-                                }
-                            }
                             new_one->size_of_chunk = remaining_size;
                             /* TODO : canary */
                             new_one->canary_chunk = (size_t)0xdeadbeefcafebabe;
@@ -127,24 +136,6 @@ size_t *verify_freed_block(size_t size)
                         next_one->free = MY_IS_FREE;
                         if(remaining_size >= size + ALIGN(sizeof(size_t)))
                         {
-                            /* Il y a de la place pour un autre bloc */
-                            if(topchunk_pool->free_metadata == NULL)
-                            {
-                                /* Liste des metadata non utilisés vide */
-                                new_one = (metadata*)((size_t)current_meta + ALIGN(sizeof(current_meta)));
-                            }
-                            else
-                            {
-                                new_one = topchunk_pool->free_metadata;
-                                if(new_one->next == NULL)
-                                {
-                                    topchunk_pool->free_metadata = NULL;
-                                }
-                                else
-                                {
-                                    topchunk_pool->free_metadata = new_one->next;
-                                }
-                            }
                             current_meta->next = new_one;
                             new_one->next = next_one;
                             new_one->size_of_chunk = remaining_size;
@@ -270,6 +261,7 @@ unsigned char find_element_to_free(void *ptr)
 {
     metadata *current_meta = meta_pool;
     void *current_chunk;
+
     while(current_meta != NULL)
     {
         current_chunk = current_meta->chunk;
@@ -279,6 +271,7 @@ unsigned char find_element_to_free(void *ptr)
             {
                 /* Le bloc devient libre */
                 current_meta->free = MY_IS_FREE;
+
                 /* Ajouter à la taille du bloc free le canary de fin */
                 current_meta->size_of_chunk += ALIGN(sizeof(size_t));
                 topchunk_pool->number_of_elements_allocated--;
@@ -287,16 +280,16 @@ unsigned char find_element_to_free(void *ptr)
                 {
                     /* Si tous les metadata sont utilisés, initier la liste */
                     topchunk_pool->free_metadata = current_meta;
-                    current_meta->next = NULL;
+                    topchunk_pool->free_metadata->next_waiting = NULL;
+                    // [X] -> [NULL] -> []
                 }
                 else
                 {
                     /* Ajouter en début de liste */
                     metadata *first = topchunk_pool->free_metadata;
                     topchunk_pool->free_metadata = current_meta;
-                    current_meta->next = first;
+                    topchunk_pool->free_metadata->next_waiting = first;
                 }
-                current_meta->free = MY_IS_NOT_HERE;
                 return 1;
             }
             else
@@ -376,7 +369,7 @@ void my_free(void *ptr) {
             exit(1);
             break;
     }
-    merge_freed_blocks();
+    //merge_freed_blocks();
 }
 
 // Fonction calloc sécurisée pour allouer et initialiser de la mémoire

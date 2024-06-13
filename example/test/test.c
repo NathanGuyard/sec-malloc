@@ -9,7 +9,7 @@
         [OK]        un malloc suivi d'un free
         [OK]        un malloc supérieur à 4 Mo  
         [OK]        un malloc supérieur à 4 Mo suivi d'un free
-        [PAS OK]        enchaînement de malloc de différentes tailles et de free, sans mélanger les appels de malloc et free
+        [OK]        enchaînement de malloc de différentes tailles et de free, sans mélanger les appels de malloc et free
 */
 int main(void)
 {

@@ -5,15 +5,15 @@
 
 #define MY_IS_FREE (size_t)0
 #define MY_IS_BUSY (size_t)1
-#define MY_IS_NOT_HERE (size_t)2
 
 typedef struct metadata {
     size_t canary_chunk;           // canary qui compare celui du chunk [ A PLACER A LA FIN D'UN BLOC ]
     size_t size_of_chunk;          // taille du chunk lié
-    size_t free;                   // libre ou occuppé ou metadata retiré de la liste
-                                   // MY_IS_NOT_HERE ne fait rien et passe au pointeur suivant
+    size_t free;                   // libre ou occuppé 
+                                    // si le chunk est libre ET présent dans free_metadata alors il est en attente de se lier à un chunk
     void *chunk;                   // pointeur vers le chunk lié avec le canary à la fin !
     struct metadata *next;         // pointeur vers la metadata suivante
+    struct metadata *next_waiting; // pointeur vers la metadata suivante qui est en attente de se lier
     size_t canary;                  // canary qui sera comparé à celui du top_chunk
 }metadata;
 
