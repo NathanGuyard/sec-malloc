@@ -4,6 +4,7 @@ PRJ = my_secmalloc
 OBJS = src/my_secmalloc.o
 SLIB = lib${PRJ}.a
 LIB = lib${PRJ}.so
+BITS = 64
 
 all: ${LIB}
 
@@ -12,8 +13,10 @@ ${LIB} : ${OBJS}
 
 ${SLIB}: ${OBJS}
 
-dynamic: CFLAGS += -DDYNAMIC
+dynamic: CFLAGS += -DDYNAMIC -g -Wno-unused-value -Wno-unused-parameter -m${BITS} -Wno-unused-function
 dynamic: ${LIB}
+dynamic: final 
+	${CC} final.c -o final
 
 static: ${SLIB}
 
@@ -23,18 +26,17 @@ clean:
 distclean: clean
 	${RM} ${SLIB} ${LIB}
 
-build_test: CFLAGS += -DTEST
+build_test: CFLAGS += -DTEST -Wno-unused-parameter -Wno-unused-variable -g -m${BITS} -Wno-unused-function
 build_test: ${OBJS} test/test.o
-	$(CC) -o test/test $^ -lcriterion -Llib
+	$(CC) -o test/test $^ -lcriterion -Llib -m${BITS} -Wno-unused-value -Wno-unused-parameter -Wno-unused-function
 
 test: build_test
 	LD_LIBRARY_PATH=./lib test/test
 
-
 .PHONY: all clean build_test dynamic test static distclean
 
 %.so:
-	$(LINK.c) -shared $^ $(LDLIBS) -o $@
+	$(LINK.c) -shared $^ $(LDLIBS) -o $@ -m${BITS}
 
 %.a:
-	${AR} ${ARFLAGS} $@ $^
+	${AR} ${ARFLAGS} $@ $^ 
