@@ -27,6 +27,7 @@ typedef struct topchunk
     size_t number_of_elements_allocated;  // nombre d'éléments alloués
     size_t number_of_elements_freed;       // nombre d'éléments libérés
     metadata *free_metadata;             // liste de metadata qui ont servi à free
+    metadata *last_metadata_allocated;   // pointeur vers dernier metadata alloué
 }topchunk;
 
 extern metadata *meta_pool;
