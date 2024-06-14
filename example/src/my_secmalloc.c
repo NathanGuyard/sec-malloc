@@ -55,9 +55,6 @@ void logfile(const char *format, ...) {
     if (written < (size_t)size) {
         perror("Error fwrite");
     }
-    // if (fprintf(report_file, "%s", message) < 0) {
-    //     perror("Error fprintf");
-    // }
 
     va_end(args);
     fflush(report_file);
