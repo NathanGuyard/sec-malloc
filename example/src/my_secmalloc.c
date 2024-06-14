@@ -94,7 +94,6 @@ size_t *verify_freed_block(size_t size)
             Il faut la liste des free et raccrocher la liste des meta a la liste des free
            */
 
-
            if(chunk_to_free != NULL)
            {
                 /* On a trouvé un data qui a été free et qui a une taille convenable pour allouer à nouveau */
@@ -102,9 +101,9 @@ size_t *verify_freed_block(size_t size)
                 /* Si un chunk est partagé par deux meta qui ont été free, intervertir les pointeurs de chunk */
                 if(current_meta != meta_linked_to_chunk_to_free)
                 {
-                        void *tmp_chunk = current_meta->chunk;
-                        current_meta->chunk = meta_linked_to_chunk_to_free->chunk;
-                        meta_linked_to_chunk_to_free->chunk = tmp_chunk;
+                    void *tmp_chunk = current_meta->chunk;
+                    current_meta->chunk = meta_linked_to_chunk_to_free->chunk;
+                    meta_linked_to_chunk_to_free->chunk = tmp_chunk;
                 }
                 if(current_meta->size_of_chunk > size + ALIGN(sizeof(size_t)))
                 {
@@ -306,20 +305,53 @@ void *my_malloc(size_t size) {
     new_meta->size_of_chunk = size; /* data sans le canary */
     topchunk_pool->current_size_data += size + ALIGN(sizeof(size_t));
 
-    if(topchunk_pool->number_of_elements_allocated != 0 || topchunk_pool->number_of_elements_freed != 0)
+    // if(topchunk_pool->number_of_elements_allocated != 0 || topchunk_pool->number_of_elements_freed != 0)
+    // {
+    //     /* Pas la première fois qu'on alloue ou free quelque chose */
+    //     metadata *previous = (metadata*)((size_t)meta_pool + topchunk_pool->current_size_metadata - ALIGN(sizeof(metadata)));
+    //     previous->next = new_meta;
+    // }
+
+    if(topchunk_pool->last_metadata_allocated != NULL)
     {
-        /* Pas la première fois qu'on alloue ou free quelque chose */
-        metadata *previous = (metadata*)((size_t)meta_pool + topchunk_pool->current_size_metadata - ALIGN(sizeof(metadata)));
-        previous->next = new_meta;
-        metadata *last_one = topchunk_pool->last_metadata_allocated;
+        if(topchunk_pool->last_metadata_allocated->next != NULL)
+        {
+            metadata *previous = topchunk_pool->last_metadata_allocated->next;
+            new_meta->next = previous;
+            topchunk_pool->last_metadata_allocated = new_meta;
+        }
+        else
+        {
+            metadata *z = topchunk_pool->last_metadata_allocated;
+            new_meta->next = z;
+            topchunk_pool->last_metadata_allocated = new_meta;
+            topchunk_pool->last_metadata_allocated->next = NULL;
+        }
     }
-    topchunk_pool->last_metadata_allocated = new_meta;
+    else
+    {
+        topchunk_pool->last_metadata_allocated = new_meta;
+    }
+    if(topchunk_pool->free_metadata != NULL)
+    {
+        topchunk_pool->free_metadata = topchunk_pool->free_metadata->next_waiting;
+    }
+    else
+    {
+        topchunk_pool->free_metadata = NULL;
+    }
 
     topchunk_pool->current_size_metadata += ALIGN(sizeof(metadata));
     topchunk_pool->number_of_elements_allocated++;
     // TODO : canary
     size_t *canary = (size_t*)((size_t)new_meta->chunk + new_meta->size_of_chunk);
     *canary = (size_t)0xdeadbeefcafebabe;
+    /*metadata *o = topchunk_pool->last_metadata_allocated;
+    for(size_t i=0;i<topchunk_pool->number_of_elements_allocated-1;i++)
+    {
+        o = o->next;
+    }
+    o->next = NULL;*/
 
     return new_meta->chunk;
 }
@@ -328,11 +360,12 @@ unsigned char find_element_to_free(void *ptr)
 {
     metadata *previous_meta = NULL;
     metadata *previous_meta_allocated = NULL;
-    metadata *current_meta = meta_pool;
+    metadata *current_meta = NULL;
     void *current_chunk;
 
-    while(current_meta != NULL)
+    for(size_t i=0;i<(topchunk_pool->number_of_elements_allocated + topchunk_pool->number_of_elements_freed);i++)
     {
+        current_meta = (metadata*)((size_t)meta_pool + i * ALIGN(sizeof(metadata))); 
         current_chunk = current_meta->chunk;
         if(current_chunk == ptr)
         {
@@ -377,7 +410,6 @@ unsigned char find_element_to_free(void *ptr)
         {
             previous_meta_allocated = previous_meta;
         }
-        current_meta = current_meta->next;
     }
     /* Not found */
     return 0;
@@ -451,17 +483,40 @@ void my_free(void *ptr) {
     //merge_freed_blocks();
 }
 
-// Fonction calloc sécurisée pour allouer et initialiser de la mémoire
 void *my_calloc(size_t nmemb, size_t size) {
-    // TODO
-    return (size_t*)0xdeadbeef;
+    char *ptr = NULL;
+    if(nmemb == 0 || size == 0)
+    {
+        ptr = my_malloc(ALIGNMENT);
+        for(size_t i = 0;i<ALIGNMENT;i++)
+        {
+            ptr[i] = 0;
+        }
+        return ptr;
+    }
+
+    ptr = my_malloc(nmemb * size);
+    for(size_t i = 0;i<(nmemb * size);i++)
+    {
+        ptr[i] = 0;
+    }
+    return ptr;
 }
 
-
-// Fonction realloc sécurisée pour redimensionner un bloc de mémoire alloué
 void *my_realloc(void *ptr, size_t size) {
-    // TODO
-    return (size_t*)0xcafebabe;
+    if(ptr != NULL && size == 0)
+    {
+        my_free(ptr);
+        return NULL;
+    }
+
+    /* Libérer le chunk et le reloger */
+    my_free(ptr);
+
+    if(ptr == NULL) return my_malloc(size);
+    if(size == 0) return my_malloc(0);
+
+    return my_malloc(size);
 }
 
 // Fonctions pour bibliothèque dynamique
