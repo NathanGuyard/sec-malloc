@@ -17,25 +17,21 @@
 
 int main(void)
 {
-    void *ptr1 = my_malloc(64);
-    my_free(ptr1);
-    void *ptr2 = my_malloc(64);
-    void *ptr3 = my_malloc(0);
-    void *ptr4 = my_malloc(640);
-    my_free(ptr4);
-    ptr4 = my_malloc(50000);
-    my_free(ptr4);
-    my_free(ptr3);
-    my_free(ptr2);
-    ptr2 = malloc(0);
-    my_free(ptr2);
-    ptr2 = malloc(0);
-    my_free(ptr2);
-    ptr2 = malloc(800000);
+    void *A = my_calloc(1,16);   
+    my_free(A);
+    void *B = my_calloc(6,12);
+    void *C = my_malloc(0);
+    my_free(B);
+    B = my_malloc(600);
+    my_free(C);
+    my_free(B);
+    A = my_calloc(8,5);
+    B = my_malloc(0);
+    C = my_malloc(0);
+    my_free(B);
+    my_free(C);
+    my_free(A);
+    int d = 4;
+    my_free(&d);
+    my_free(B);
 }
-
-/*
-malloc(64) -> 0x2710048 (0x40) (busy)
-free().... (free)
-
-*/
