@@ -13,10 +13,8 @@ ${LIB} : ${OBJS}
 
 ${SLIB}: ${OBJS}
 
-dynamic: CFLAGS += -DDYNAMIC -g -Wno-unused-value -Wno-unused-parameter -m${BITS} -Wno-unused-function
+dynamic: CFLAGS += -DDYNAMIC -g -m${BITS}
 dynamic: ${LIB}
-dynamic: final 
-	${CC} final.c -o final
 
 static: ${SLIB}
 
@@ -26,9 +24,9 @@ clean:
 distclean: clean
 	${RM} ${SLIB} ${LIB}
 
-build_test: CFLAGS += -DTEST -Wno-unused-parameter -Wno-unused-variable -g -m${BITS} -Wno-unused-function
+build_test: CFLAGS += -DTEST -g -m${BITS}
 build_test: ${OBJS} test/test.o
-	$(CC) -o test/test $^ -lcriterion -Llib -m${BITS} -Wno-unused-value -Wno-unused-parameter -Wno-unused-function
+	$(CC) -o test/test $^ -lcriterion -Llib -m${BITS} 
 
 test: build_test
 	LD_LIBRARY_PATH=./lib test/test
