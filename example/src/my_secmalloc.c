@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <x86intrin.h>
 
 /* Directives de préprocesseur pour l'alignement sur 8 octets / 4 octets selon l'architecture */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(__ppc64__)
@@ -60,6 +61,10 @@ void logfile(const char *format, ...) {
 }
 
 __attribute__((constructor))
+/* report_file utilise fopen, qui utilise malloc ! 
+        puisque le malloc initialise le topchunk_pool et la meta_pool, FILE sera mappé au debut de metapool...
+        apparemment le malloc du fopen alloue 0x1d8 octets.
+        on utilise alors open / write qui n'utilisent pas malloc */
 void initialize_report() {
     const char *filename = getenv("MSM_OUTPUT");
     if (filename != NULL) {
@@ -79,21 +84,105 @@ void close_report() {
     }
 }
 
-static void init_pools(void) {
-    /* Construction du top_chunk */
-
-    /* report_file utilise fopen, qui utilise malloc ! 
-        puisque le malloc initialise le topchunk_pool et la meta_pool, FILE sera mappé dans ces eaux là...
-        apparemment le malloc du fopen alloue 0x1d8 octets.
-        On réseve 4 Ko octets quelque part pour FILE.*/
-
-    if(report_file == -1)
+size_t get_random_canary(void)
+{
+    int fd = open("/dev/urandom", O_RDONLY, 0);
+    size_t canary_value = 0xdeadbe00cafeba00;
+    if(fd != -1)
     {
+        /* Si l'ouverture du fichier /dev/urandom n'a pas marché, le canary est généré par rdtsc.
+           Pour éviter du leak d'infos dans la heap, on finit le canary par 00*/
+        canary_value = __rdtsc();
+    }
+    else
+    {
+        read(fd,&canary_value,ALIGNMENT);
+    }
+    /* Pour éviter du leak d'infos dans la heap, on finit le canary par 00*/
+    return canary_value ^ (canary_value & 0xff);
+}
 
+unsigned char generate_random_value(size_t min, size_t max)
+{
+    int fd = open("/dev/urandom", O_RDONLY, 0);
+    size_t random_value = 0xdeadbe00cafeba00;
+    if(fd != -1)
+    {
+        /* Si l'ouverture du fichier /dev/urandom n'a pas marché, génération par rdtsc (Plus dangereux car réduit l'entropie) */
+        random_value = __rdtsc();
+    }
+    else
+    {
+        read(fd,&random_value,ALIGNMENT);
     }
 
-    /* On commence la liste des metadata 40 Mo après l'adresse nulle en croisant les doigts */
-    topchunk_pool = mmap((size_t*)(MY_PAGE_SIZE * 10000), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* Permet de choisir un nombre aléatoire entre min et max */
+    return min + (random_value % (max - min + 1));
+}
+
+static void init_pools(void) {
+    /* Construction du top_chunk */
+    /* Mapping de 4 Mo partout */
+
+    /* Adresse à ne pas dépasser : 0x400000000000 */
+       /*
+        Top_chunk min address : 0x64000 
+        Top_chunk max address : 0x2710000
+        Différence : 40550400 (0x26ac000) (environ 41 Mo)
+        top_chunk_pool min size : 4254003200 (Environ 4 Go)
+        top_chunk_pool max size : 4294553600 (Environ 4 Go)
+        Min aslr value : 0
+        max alsr value : 0x26ac000
+        Nombre d'adresses à bruteforce : 0x26ac (9900)
+       */
+
+      /*
+        data_pool min address : 0xfffff000
+        data_pool max address : 0x5000000000
+        Différence : 339302420480 (0x4f00001000) (environ 339 Go)
+        data_pool min size : 70025146793984 (Environ 70 To)
+        data_pool max_size : 70364449214464 (Environ 70 To)
+        Min aslr value : 0
+        max alsr value : 0x4f00001
+        Nombre d'adresses à bruteforce : 0x4f00001 (82 837 505)
+      */
+     // ======================================================================
+     /* Adresse à ne pas dépasser : 0x40000000 */
+         /*
+        Top_chunk min address : 0x64000 
+        Top_chunk max address : 0x1000000
+        Différence : 16367616 (0xf9c000) (environ 16 Mo)
+        top_chunk_pool min size : 764346368 (Environ 765 Mo)
+        top_chunk_pool max size : 804896768 (Environ 805 Mo)
+        Min aslr value : 0
+        max alsr value : 0xf9c000
+        Nombre d'adresses à bruteforce : 0xf9c (4041)
+       */
+
+      /*
+        data_pool min address : 0x20000000
+        data_pool max address : 0x2ffff000
+        Différence : 268431360 (0xffff000) (environ 268 Mo)
+        data_pool min size : 268439552 (Environ 268 Mo)
+        data_pool max_size : 536870912 (Environ 537 Mo)
+        Min aslr value : 0
+        max alsr value : 0xffff000
+        Nombre d'adresses à bruteforce : 0xffff (65535)
+      */
+    size_t base_address;
+    
+    if(ALIGNMENT == 8)
+    {
+        base_address = MY_PAGE_SIZE * 100;
+        size_t aslr = generate_random_value(0,0x26ac) * MY_PAGE_SIZE;
+        topchunk_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    else
+    {
+        base_address = MY_PAGE_SIZE * 100;
+        size_t aslr = generate_random_value(0,0xf9c) * MY_PAGE_SIZE;
+        topchunk_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if(topchunk_pool == MAP_FAILED)
     {
         logfile("*** ERROR *** : mmap topchunk_pool failed.\nExit !\n");
@@ -102,7 +191,7 @@ static void init_pools(void) {
     }
 
     /* TODO : topchunk_pool canary */
-    topchunk_pool->canary = (size_t)0xdeadbeefcafebabe;
+    topchunk_pool->canary = get_random_canary();
     topchunk_pool->total_size_metadata = INITIAL_MMAP_SIZE;
     topchunk_pool->current_size_metadata = 0;
     topchunk_pool->number_of_elements_allocated = 0;
@@ -110,8 +199,18 @@ static void init_pools(void) {
     topchunk_pool->free_metadata = NULL;
     topchunk_pool->metadata_allocated = NULL;
 
-    /* On commence la liste des data 40 Go après l'adresse nulle en croisant les doigts */
-    data_pool = mmap((size_t*)(MY_PAGE_SIZE * 10000000), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(ALIGNMENT == 8)
+    {
+        base_address = MY_PAGE_SIZE * 1048575;
+        size_t aslr = generate_random_value(0,0x4f00001) * MY_PAGE_SIZE;
+        data_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    else
+    {
+        base_address = MY_PAGE_SIZE * 131072;
+        size_t aslr = generate_random_value(0,0xffff) * MY_PAGE_SIZE;
+        data_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if(data_pool == MAP_FAILED)
     {
         logfile("*** ERROR *** : mmap data_pool failed.\nExit !\n");
@@ -128,8 +227,6 @@ static void init_pools(void) {
     logfile("[+] topchunk_pool mapped @ %p\n",topchunk_pool);
     logfile("[+] meta_pool mapped @ %p\n",meta_pool);
     logfile("==============================[ End Pools Initialisation ]==============================\n\n");
-
-    /* Espace d'environ 4 Go qui sépare la liste des metadata à la data pool */
 }
 
 size_t *verify_freed_block(size_t size)
@@ -239,9 +336,9 @@ size_t *verify_freed_block(size_t size)
                     }
                     // TODO : canary
                     size_t *canary = (size_t*)((size_t)current_chunk + size);
-                    *canary = (size_t)0xaabbccddddccbbaa;
-                    new_frag->canary = (size_t)0xdeadbeefcafebabe;
-                    new_frag->canary_chunk = (size_t)0xdeadbeefcafebabe;
+                    *canary = get_random_canary();
+                    new_frag->canary = get_random_canary();
+                    new_frag->canary_chunk = get_random_canary();
                     new_frag->free = MY_IS_BUSY;
                     new_frag->next_waiting = NULL;
                     new_frag->chunk = current_chunk;
@@ -316,8 +413,8 @@ size_t *verify_freed_block(size_t size)
                     }
 
                     // TODO : canary
-                    new_frag_next->canary = (size_t)0xdeadbeefcafebabe;
-                    new_frag_next->canary_chunk = (size_t)0xdeadbeefcafebabe;
+                    new_frag_next->canary = get_random_canary();
+                    new_frag_next->canary_chunk = get_random_canary();
                     new_frag_next->free = MY_IS_FREE;
                     new_frag_next->size_of_chunk = remaining_size;
                     new_frag_next->next = NULL;
@@ -364,9 +461,9 @@ size_t *verify_freed_block(size_t size)
 
                     // TODO : canary
                     size_t *canary = (size_t*)((size_t)current_chunk + size);
-                    *canary = (size_t)0xaabbccddddccbbaa;
-                    new_frag->canary = (size_t)0xdeadbeefcafebabe;
-                    new_frag->canary_chunk = (size_t)0xdeadbeefcafebabe;
+                    *canary = get_random_canary();
+                    new_frag->canary = get_random_canary();
+                    new_frag->canary_chunk = get_random_canary();
                     new_frag->free = MY_IS_BUSY;
                     new_frag->size_of_chunk = size;
                     new_frag->next_waiting = NULL;
@@ -458,8 +555,8 @@ void *my_malloc(size_t size) {
     /* Ajout du metadata à la fin de la liste */
     metadata *new_meta = (metadata*)((size_t)meta_pool + topchunk_pool->current_size_metadata);
     /* TODO : canary */
-    new_meta->canary_chunk = (size_t)0xdeadbeefcafebabe;
-    new_meta->canary = (size_t)0xdeadbeefcafebabe;
+    new_meta->canary_chunk = get_random_canary();
+    new_meta->canary = get_random_canary();
     new_meta->chunk = data_pool + topchunk_pool->current_size_data;
     new_meta->free = MY_IS_BUSY;
     new_meta->next = NULL;
@@ -487,7 +584,7 @@ void *my_malloc(size_t size) {
     // chunk[new_meta->size_of_chunk] = (size_t)0xaabbccddddccbbaa;
     size_t *canary = (size_t*)((size_t)new_meta->chunk + new_meta->size_of_chunk);
     
-    *canary = (size_t)0xaabbccddddccbbaa;
+    *canary = get_random_canary();
     logfile("[+] %zu bytes allocated @ %p\n",size,new_meta->chunk);
 
     return new_meta->chunk;
