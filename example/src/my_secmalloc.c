@@ -68,7 +68,7 @@ __attribute__((constructor))
 void initialize_report() {
     const char *filename = getenv("MSM_OUTPUT");
     if (filename != NULL) {
-        report_file = open("logs.log", O_WRONLY | O_CREAT, 0644);
+        report_file = open(filename, O_WRONLY | O_CREAT, 0644);
         if (report_file == -1) {
             perror("Failed to open report file");
             exit(EXIT_FAILURE);
