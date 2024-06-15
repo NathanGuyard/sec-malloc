@@ -6,191 +6,785 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
+#include <fcntl.h>
+#include <x86intrin.h>
 
-// Variables globales pour les pools de mémoire
-void *data_pool = NULL; // Pool de données
-block_meta_t *meta_pool = NULL; // Pool de métadonnées
-size_t data_pool_size = 0; // Taille du pool de données
-size_t meta_pool_size = 0; // Taille du pool de métadonnées
+/* Directives de préprocesseur pour l'alignement sur 8 octets / 4 octets selon l'architecture */
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(__ppc64__)
+    #define ALIGNMENT 8
+#elif defined(__i386__) || defined(_M_IX86) || defined(__arm__) || defined(__PPC__)
+    #define ALIGNMENT 4
+#else
+    #define ALIGNMENT 8
+#endif
 
-// Taille initiale des pools
-#define INITIAL_DATA_POOL_SIZE (1024 * 1024) // 1 Mo
-#define INITIAL_META_POOL_SIZE (1024 * 1024) // 1 Mo
+#define MY_PAGE_SIZE (size_t)4096
+#define INITIAL_MMAP_SIZE (MY_PAGE_SIZE * 1000) // 4 Mo
+#define ALIGN(size) (size_t)((size + (ALIGNMENT - 1)) & (~(ALIGNMENT - 1)))
 
-// Alignement des blocs de mémoire
-#define ALIGNMENT 8
+metadata *meta_pool = NULL;
+topchunk *topchunk_pool = NULL;
+void *data_pool = NULL;
+int report_file = -1;
 
-// Aligner la taille sur la taille de l'alignement
-#define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1))
+void logfile(const char *format, ...) {
+    if(report_file == -1) return;
 
-// Fonction d'initialisation des pools de mémoire
-static void init_pools() {
-    // Allouer le pool de données en utilisant mmap
-    // NULL: le système choisit l'adresse de début
-    // INITIAL_DATA_POOL_SIZE: taille de la région de mémoire (1 Mo)
-    // PROT_READ | PROT_WRITE: mémoire lisible et modifiable
-    // MAP_PRIVATE | MAP_ANONYMOUS: mémoire privée et anonyme (pas associée à un fichier)
-    // -1 et 0: ignorés car MAP_ANONYMOUS est spécifié
-    data_pool = mmap(NULL, INITIAL_DATA_POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // Vérifier si mmap a échoué pour le pool de données
-    if (data_pool == MAP_FAILED) {
-        // Afficher un message d'erreur et terminer le programme
-        perror("mmap data_pool");
-        exit(EXIT_FAILURE);
+    va_list args;
+    va_start(args, format);
+
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int size = vsnprintf(NULL, 0, format, args_copy);
+    va_end(args_copy);
+    if (size < 0) {
+        perror("Error vsnprintf");
+        va_end(args);
+        return;
     }
-    // Définir la taille du pool de données
-    data_pool_size = INITIAL_DATA_POOL_SIZE;
 
-    // Allouer le pool de métadonnées en utilisant mmap
-    // Les paramètres sont similaires à ceux utilisés pour le pool de données
-    meta_pool = mmap(NULL, INITIAL_META_POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    // Vérifier si mmap a échoué pour le pool de métadonnées
-    if (meta_pool == MAP_FAILED) {
-        // Afficher un message d'erreur et terminer le programme
-        perror("mmap meta_pool");
-        exit(EXIT_FAILURE);
+    char *message = (char *)alloca(size + 1);
+    if (message == NULL) {
+        perror("Error alloca");
+        va_end(args);
+        return;
     }
-    // Définir la taille du pool de métadonnées
-    meta_pool_size = INITIAL_META_POOL_SIZE;
 
-    // Initialiser le premier descripteur de bloc dans le pool de métadonnées
-    // Indique que toute la taille du pool de données est disponible pour l'allocation
-    meta_pool->size = data_pool_size;
-    // Marquer le bloc comme libre (1 signifie libre, 0 signifie occupé)
-    meta_pool->free = 1;
-    // Pas d'autres descripteurs de bloc, donc le champ next est défini sur NULL
-    meta_pool->next = NULL;
+    vsnprintf(message, size + 1, format, args);
+
+    if (write(report_file, message, size) != size) {
+        perror("Error write");
+    }
+
+    va_end(args);
 }
 
-
-// Fonction malloc sécurisée pour allouer de la mémoire dans le pool géré manuellement
-void *my_malloc(size_t size) {
-    // Aligner la taille demandée sur un multiple de l'alignement défini pour éviter le "fragmentation interne"
-    size = ALIGN(size);
-
-    // Initialiser les pools de mémoire si ce n'est pas déjà fait
-    if (!data_pool || !meta_pool) {
-        init_pools(); // Appelle la fonction d'initialisation des pools de mémoire
-    }
-
-    // Parcourir la liste des descripteurs pour trouver un bloc de mémoire libre suffisamment grand
-    block_meta_t *current = meta_pool;
-    while (current) {
-        // Vérifier si le bloc courant est libre et si sa taille est suffisante
-        if (current->free && current->size >= size) {
-            // Calculer l'espace restant après l'allocation de la taille demandée
-            size_t remaining_size = current->size - size - sizeof(block_meta_t);
-            // Vérifier s'il reste assez de place pour créer un nouveau descripteur de bloc après l'allocation
-            if (remaining_size > sizeof(block_meta_t)) {
-                // Créer un nouveau descripteur pour le bloc de mémoire restant après celui qui sera alloué
-                block_meta_t *new_meta = (block_meta_t *)((char *)current + sizeof(block_meta_t) + size);
-                new_meta->size = remaining_size;
-                new_meta->free = 1; // Marquer le nouveau bloc comme libre
-                new_meta->next = current->next; // Insérer le nouveau bloc dans la liste
-                current->size = size; // Ajuster la taille du bloc courant à la taille demandée
-                current->next = new_meta; // Faire pointer le bloc courant vers le nouveau bloc
-            }
-            // Marquer le bloc courant comme occupé
-            current->free = 0;
-            // Retourner l'adresse du début du bloc de données, juste après le descripteur
-            return (char *)current + sizeof(block_meta_t);
+__attribute__((constructor))
+/* report_file utilise fopen, qui utilise malloc ! 
+        puisque le malloc initialise le topchunk_pool et la meta_pool, FILE sera mappé au debut de metapool...
+        apparemment le malloc du fopen alloue 0x1d8 octets.
+        on utilise alors open / write qui n'utilisent pas malloc */
+void initialize_report() {
+    const char *filename = getenv("MSM_OUTPUT");
+    if (filename != NULL) {
+        report_file = open("logs.log", O_WRONLY | O_CREAT, 0644);
+        if (report_file == -1) {
+            perror("Failed to open report file");
+            exit(EXIT_FAILURE);
         }
-        // Passer au descripteur de bloc suivant
-        current = current->next;
+    }
+}
+
+__attribute__((destructor))
+void close_report() {
+    if(report_file != -1)
+    {
+        close(report_file);
+    }
+}
+
+size_t get_random_canary(void)
+{
+    int fd = open("/dev/urandom", O_RDONLY, 0);
+    size_t canary_value = 0xdeadbe00cafeba00;
+    if(fd != -1)
+    {
+        /* Si l'ouverture du fichier /dev/urandom n'a pas marché, le canary est généré par rdtsc.
+           Pour éviter du leak d'infos dans la heap, on finit le canary par 00*/
+        canary_value = __rdtsc();
+    }
+    else
+    {
+        read(fd,&canary_value,ALIGNMENT);
+    }
+    /* Pour éviter du leak d'infos dans la heap, on finit le canary par 00*/
+    return canary_value ^ (canary_value & 0xff);
+}
+
+unsigned char generate_random_value(size_t min, size_t max)
+{
+    int fd = open("/dev/urandom", O_RDONLY, 0);
+    size_t random_value = 0xdeadbe00cafeba00;
+    if(fd != -1)
+    {
+        /* Si l'ouverture du fichier /dev/urandom n'a pas marché, génération par rdtsc (Plus dangereux car réduit l'entropie) */
+        random_value = __rdtsc();
+    }
+    else
+    {
+        read(fd,&random_value,ALIGNMENT);
     }
 
-    // Si aucun bloc adéquat n'est trouvé, il faudrait normalement agrandir le pool de mémoire
-    // Ceci n'est pas implémenté ici; une implémentation pourrait utiliser mremap pour agrandir le pool
-    // Retourner NULL pour indiquer l'échec de l'allocation
+    /* Permet de choisir un nombre aléatoire entre min et max */
+    return min + (random_value % (max - min + 1));
+}
+
+static void init_pools(void) {
+    /* Construction du top_chunk */
+    /* Mapping de 4 Mo partout */
+
+    /* Adresse à ne pas dépasser : 0x400000000000 */
+       /*
+        Top_chunk min address : 0x64000 
+        Top_chunk max address : 0x2710000
+        Différence : 40550400 (0x26ac000) (environ 41 Mo)
+        top_chunk_pool min size : 4254003200 (Environ 4 Go)
+        top_chunk_pool max size : 4294553600 (Environ 4 Go)
+        Min aslr value : 0
+        max alsr value : 0x26ac000
+        Nombre d'adresses à bruteforce : 0x26ac (9900)
+       */
+
+      /*
+        data_pool min address : 0xfffff000
+        data_pool max address : 0x5000000000
+        Différence : 339302420480 (0x4f00001000) (environ 339 Go)
+        data_pool min size : 70025146793984 (Environ 70 To)
+        data_pool max_size : 70364449214464 (Environ 70 To)
+        Min aslr value : 0
+        max alsr value : 0x4f00001
+        Nombre d'adresses à bruteforce : 0x4f00001 (82 837 505)
+      */
+     // ======================================================================
+     /* Adresse à ne pas dépasser : 0x40000000 */
+         /*
+        Top_chunk min address : 0x64000 
+        Top_chunk max address : 0x1000000
+        Différence : 16367616 (0xf9c000) (environ 16 Mo)
+        top_chunk_pool min size : 764346368 (Environ 765 Mo)
+        top_chunk_pool max size : 804896768 (Environ 805 Mo)
+        Min aslr value : 0
+        max alsr value : 0xf9c000
+        Nombre d'adresses à bruteforce : 0xf9c (4041)
+       */
+
+      /*
+        data_pool min address : 0x20000000
+        data_pool max address : 0x2ffff000
+        Différence : 268431360 (0xffff000) (environ 268 Mo)
+        data_pool min size : 268439552 (Environ 268 Mo)
+        data_pool max_size : 536870912 (Environ 537 Mo)
+        Min aslr value : 0
+        max alsr value : 0xffff000
+        Nombre d'adresses à bruteforce : 0xffff (65535)
+      */
+    size_t base_address;
+    
+    if(ALIGNMENT == 8)
+    {
+        base_address = MY_PAGE_SIZE * 100;
+        size_t aslr = generate_random_value(0,0x26ac) * MY_PAGE_SIZE;
+        topchunk_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    else
+    {
+        base_address = MY_PAGE_SIZE * 100;
+        size_t aslr = generate_random_value(0,0xf9c) * MY_PAGE_SIZE;
+        topchunk_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    if(topchunk_pool == MAP_FAILED)
+    {
+        logfile("*** ERROR *** : mmap topchunk_pool failed.\nExit !\n");
+        perror("mmap meta_pool");
+        exit(1);
+    }
+
+    /* TODO : topchunk_pool canary */
+    topchunk_pool->canary = get_random_canary();
+    topchunk_pool->total_size_metadata = INITIAL_MMAP_SIZE;
+    topchunk_pool->current_size_metadata = 0;
+    topchunk_pool->number_of_elements_allocated = 0;
+    topchunk_pool->number_of_elements_freed = 0;
+    topchunk_pool->free_metadata = NULL;
+    topchunk_pool->metadata_allocated = NULL;
+
+    if(ALIGNMENT == 8)
+    {
+        base_address = MY_PAGE_SIZE * 1048575;
+        size_t aslr = generate_random_value(0,0x4f00001) * MY_PAGE_SIZE;
+        data_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    else
+    {
+        base_address = MY_PAGE_SIZE * 131072;
+        size_t aslr = generate_random_value(0,0xffff) * MY_PAGE_SIZE;
+        data_pool = mmap((size_t*)(base_address + aslr), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    if(data_pool == MAP_FAILED)
+    {
+        logfile("*** ERROR *** : mmap data_pool failed.\nExit !\n");
+        perror("mmap meta_pool");
+        exit(1);
+    }
+
+    topchunk_pool->current_size_data = 0;
+    topchunk_pool->total_size_data = INITIAL_MMAP_SIZE;
+
+    meta_pool = (metadata*)((size_t)topchunk_pool + ALIGN(sizeof(topchunk)));
+
+    logfile("==============================[ Start Pools Initialisation ]==============================\n");
+    logfile("[+] topchunk_pool mapped @ %p\n",topchunk_pool);
+    logfile("[+] meta_pool mapped @ %p\n",meta_pool);
+    logfile("==============================[ End Pools Initialisation ]==============================\n\n");
+}
+
+size_t *verify_freed_block(size_t size)
+{
+    if(topchunk_pool->number_of_elements_freed == 0) return NULL;
+    void * chunk_to_free = NULL;
+    metadata *meta_linked_to_chunk_to_free = NULL;
+    metadata *_ = meta_pool;
+    for(size_t i=0;i<(topchunk_pool->number_of_elements_allocated + topchunk_pool->number_of_elements_freed);i++)
+    {
+        /* Pour chaque bloc indépendemment de leur ordre, on récupère le meta qui est free et qui a une taille de data suffisante */
+        metadata *m = (metadata*)((size_t)_ + (i * ALIGN(sizeof(metadata))));
+        if(m->size_of_chunk + ALIGN(sizeof(size_t)) >= size + ALIGN(sizeof(size_t)) && m->free == MY_IS_FREE)
+        {
+            chunk_to_free = m->chunk;
+            meta_linked_to_chunk_to_free = m;
+            break;
+        }
+    }
+    if(meta_pool != NULL)
+    {
+        metadata *current_meta = topchunk_pool->free_metadata;
+        while(current_meta != NULL)
+        {
+            /* Si un bloc libre a une taille suffisante
+                    Si la taille est supérieure alors on fragmente
+                        Si présence de free_metadata alors on utilise jusqu'à épuisement sinon on crée des meta à la fin
+                    Si la taille est parfaite
+                        Si présence de free_metadata alors on utilise jusqu'à épuisement sinon on crée des meta à la fin
+                Sinon on retourne NULL
+            */
+
+           /*
+            On a la liste des meta qui sont seuls
+            Il faut la liste des free et raccrocher la liste des meta a la liste des free
+           */
+
+           if(chunk_to_free != NULL)
+           {
+                /* On a trouvé un data qui a été free et qui a une taille convenable pour allouer à nouveau */
+                void* current_chunk = chunk_to_free;
+                /* Si un chunk est partagé par deux meta qui ont été free, intervertir les pointeurs de chunk */
+                if(current_meta != meta_linked_to_chunk_to_free)
+                {
+                    void *tmp_chunk = current_meta->chunk;
+                    current_meta->chunk = meta_linked_to_chunk_to_free->chunk;
+                    meta_linked_to_chunk_to_free->chunk = tmp_chunk;
+                }
+                if(current_meta->size_of_chunk > size + ALIGN(sizeof(size_t)))
+                {
+                    /* Le bloc trouvé a une taille supérieure à la taille demandée : fragmentation du bloc */
+                    /* Priorité aux meta qui attendent */
+                    metadata *new_frag;
+                    if(topchunk_pool->free_metadata != NULL)
+                    {
+                        /* Si au moins un meta est free alors on le libère pour en faire un occuppé */
+                        new_frag = topchunk_pool->free_metadata;
+                        metadata *_ = topchunk_pool->free_metadata;
+                        metadata *previous = NULL;
+                        while(_ != NULL)
+                        {
+                            if(_->next_waiting == new_frag)   
+                            {
+                                previous = _;
+                                break;
+                            }
+                            _ = _->next_waiting;
+                        }
+                        /* Si le bloc avait un suivant alors raccrocher son précédent avec son suivant pour l'enlever de la liste des éléments alloués */
+                        if(previous != NULL)
+                        {
+                            /* Le bloc avait un meta free précédent */
+                            if(new_frag->next_waiting != NULL)
+                            {
+                                /* Le bloc avait un meta free suivant et précédent */
+                                metadata *next_one = new_frag->next_waiting;
+                                previous->next_waiting = next_one;
+                            }
+                            else
+                            {
+                                /* Le bloc n'avait qu'un meta free précédent */
+                                previous->next_waiting = NULL;
+                            }
+                        }
+                        else
+                        {
+                            /* Le bloc n'avait pas de meta free précédent */
+                            if(new_frag->next_waiting != NULL)
+                            {
+                                /* Le bloc n'avait qu'un meta free suivant */
+                                metadata *next_one = new_frag->next_waiting;
+                                topchunk_pool->free_metadata = next_one;
+                                next_one->next_waiting = NULL;
+                            }
+                            else
+                            {
+                                /* Le bloc n'avait ni de meta free suivant ni précédent */
+                                topchunk_pool->free_metadata = NULL;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        /* new_frag_next sera contigu dans la mémoire car toutes les meta sont occuppées */
+                        new_frag = (metadata*)((size_t)meta_pool + ALIGN(sizeof(metadata)) * (topchunk_pool->number_of_elements_allocated + topchunk_pool->number_of_elements_freed));
+                        topchunk_pool->current_size_metadata += ALIGN(sizeof(metadata));
+                    }
+                    // TODO : canary
+                    size_t *canary = (size_t*)((size_t)current_chunk + size);
+                    *canary = get_random_canary();
+                    new_frag->canary = get_random_canary();
+                    new_frag->canary_chunk = get_random_canary();
+                    new_frag->free = MY_IS_BUSY;
+                    new_frag->next_waiting = NULL;
+                    new_frag->chunk = current_chunk;
+                    new_frag->next = NULL;
+                    /* Si au moins un élément est déjà alloué, mettre le nouveau meta alloué à la suite */
+                    if(topchunk_pool->metadata_allocated != NULL)
+                    {
+                        metadata *n = topchunk_pool->metadata_allocated;
+                        while(n->next != NULL){n = n->next;}
+                        n->next = new_frag;
+                    }
+                    else
+                    {
+                        topchunk_pool->metadata_allocated = new_frag;
+                    }
+                    size_t remaining_size = new_frag->size_of_chunk - (size + ALIGN(sizeof(size_t)));
+                    new_frag->size_of_chunk = size;
+                    metadata *new_frag_next;
+                    if(topchunk_pool->free_metadata != NULL)
+                    {
+                        /* Si au moins un meta est free alors on le libère pour en faire un occuppé */
+                        new_frag_next = topchunk_pool->free_metadata;
+                        metadata *_ = topchunk_pool->free_metadata;
+                        metadata *previous = NULL;
+                        while(_ != NULL)
+                        {
+                            if(_->next_waiting == new_frag_next)   
+                            {
+                                previous = _;
+                                break;
+                            }
+                            _ = _->next_waiting;
+                        }
+                        /* Si le bloc avait un suivant alors raccrocher son précédent avec son suivant pour l'enlever de la liste des éléments alloués */
+                        if(previous != NULL)
+                        {
+                            /* Le bloc avait un meta free précédent */
+                            if(new_frag_next->next_waiting != NULL)
+                            {
+                                /* Le bloc avait un meta free suivant et précédent */
+                                metadata *next_one = new_frag_next->next_waiting;
+                                previous->next_waiting = next_one;
+                            }
+                            else
+                            {
+                                /* Le bloc n'avait qu'un meta free précédent */
+                                previous->next_waiting = NULL;
+                            }
+                        }
+                        else
+                        {
+                            /* Le bloc n'avait pas de meta free précédent */
+                            if(new_frag_next->next_waiting != NULL)
+                            {
+                                /* Le bloc n'avait qu'un meta free suivant */
+                                metadata *next_one = new_frag_next->next_waiting;
+                                topchunk_pool->free_metadata = next_one;
+                                next_one->next_waiting = NULL;
+                            }
+                            else
+                            {
+                                /* Le bloc n'avait ni de meta free suivant ni précédent */
+                                topchunk_pool->free_metadata = NULL;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        /* Si aucun meta n'est free, alors new_frag_next se colle à new_frag */
+                        new_frag_next = (metadata*)((size_t)meta_pool + topchunk_pool->current_size_metadata);
+                        topchunk_pool->current_size_metadata += ALIGN(sizeof(metadata));
+                    }
+
+                    // TODO : canary
+                    new_frag_next->canary = get_random_canary();
+                    new_frag_next->canary_chunk = get_random_canary();
+                    new_frag_next->free = MY_IS_FREE;
+                    new_frag_next->size_of_chunk = remaining_size;
+                    new_frag_next->next = NULL;
+                    new_frag_next->next_waiting = NULL;
+                    new_frag_next->chunk = (void*)((size_t)current_chunk + size + ALIGN(sizeof(size_t)));
+                    if(topchunk_pool->free_metadata != NULL)
+                    {
+                        metadata *n = topchunk_pool->metadata_allocated;
+                        while(n->next != NULL){n = n->next;}
+                        n->next = new_frag_next;
+                    }
+                    else
+                    {
+                        topchunk_pool->free_metadata = new_frag_next;
+                    }
+                    topchunk_pool->number_of_elements_allocated++;
+                    logfile("[+] %zu bytes allocated @ %p\n └──> ",size,new_frag->chunk);
+                    logfile("Chunk @ %p fragmented => new freed chunk created @ %p\n",new_frag,new_frag_next->chunk);
+                }
+                else
+                {
+                    /* Le bloc trouvé a la taille parfaite : pas de fragmentation de bloc */
+                    /* Priorité aux meta qui attendent */
+                    metadata *new_frag;
+                    if(topchunk_pool->free_metadata != NULL)
+                    {
+                        /* Si au moins un meta a été libéré, l'allouer */
+                        new_frag = topchunk_pool->free_metadata;
+                        if(topchunk_pool->free_metadata->next_waiting != NULL)
+                        {
+                            /* Si le meta libéré a un suivant, le mettre en tête de liste */
+                            topchunk_pool->free_metadata = topchunk_pool->free_metadata->next_waiting;
+                        }
+                        else
+                        {
+                            topchunk_pool->free_metadata = NULL;
+                        }
+                    }
+                    else
+                    {
+                        /* Aucun meta libre n'est trouvé : ajouter le meta à la fin */
+                        new_frag = (metadata*)((size_t)current_meta + ALIGN(sizeof(metadata)));
+                    }
+
+                    // TODO : canary
+                    size_t *canary = (size_t*)((size_t)current_chunk + size);
+                    *canary = get_random_canary();
+                    new_frag->canary = get_random_canary();
+                    new_frag->canary_chunk = get_random_canary();
+                    new_frag->free = MY_IS_BUSY;
+                    new_frag->size_of_chunk = size;
+                    new_frag->next_waiting = NULL;
+                    new_frag->next = NULL;
+                    new_frag->chunk = current_chunk;
+                    /* Si au moins un élément est déjà alloué, mettre le nouveau meta alloué à la suite */
+                    if(topchunk_pool->metadata_allocated != NULL)
+                    {
+                        metadata *n = topchunk_pool->metadata_allocated;
+                        while(n->next != NULL){n = n->next;}
+                        n->next = new_frag;
+                    }
+                    else
+                    {
+                        topchunk_pool->metadata_allocated = new_frag;
+                    }
+                    topchunk_pool->number_of_elements_allocated++;
+                    topchunk_pool->number_of_elements_freed--;
+                    logfile("[+] %zu bytes allocated @ %p\n",size,new_frag->chunk);
+                }
+                
+                return current_chunk;
+           }
+           current_meta = current_meta->next_waiting;
+        }
+    }
     return NULL;
 }
 
+void get_more_memory_mmap_metadata(void)
+{
+    /* Augmenter de la taille d'une page */
+    void *ptr = mremap(topchunk_pool,topchunk_pool->total_size_metadata, topchunk_pool->total_size_metadata + MY_PAGE_SIZE, MREMAP_MAYMOVE);
+    if(topchunk_pool == MAP_FAILED || ptr != topchunk_pool)
+    {
+        logfile("*** ERROR *** : mremap for topchunk_pool failed\n");
+        perror("mmap meta_pool");
+        exit(1);
+    }
+    topchunk_pool->total_size_metadata = topchunk_pool->total_size_metadata + MY_PAGE_SIZE;
+    logfile("[+] Not enough memory for topchunk_pool @ %p : successfully mapped %zu more bytes\n",topchunk_pool,MY_PAGE_SIZE);
+}
 
-// Fonction de libération de mémoire sécurisée
-void my_free(void *ptr) {
-    // Si le pointeur est NULL, ne rien faire
-    if (!ptr) return;
+void get_more_memory_mmap_data(size_t size)
+{
+    /* Augmenter de size + ALIGN(sizeof(size_t)) pour le canary (aligné sur une page !) */
+    size_t new_aligned_size = (size_t)(((topchunk_pool->total_size_data + size + ALIGN(sizeof(size_t))) + (MY_PAGE_SIZE - 1)) & (~(MY_PAGE_SIZE - 1)));
+    void *ptr = mremap(data_pool,topchunk_pool->total_size_data, new_aligned_size, MREMAP_MAYMOVE);
+    if(topchunk_pool == MAP_FAILED || ptr != data_pool)
+    {
+        logfile("*** ERROR *** : mremap for data_pool failed\n");
+        perror("mmap meta_pool");
+        exit(1);
+    }
+    topchunk_pool->total_size_data = new_aligned_size;
+    logfile("[+] Not enough memory for data_pool @ %p : successfully mapped %zu more bytes\n",data_pool,MY_PAGE_SIZE);
+}
 
-    // Obtenir le descripteur de bloc correspondant au bloc de données à partir du pointeur
-    // Le descripteur se trouve juste avant l'adresse du bloc de données
-    block_meta_t *meta = (block_meta_t *)((char *)ptr - sizeof(block_meta_t));
-    // Marquer le bloc comme libre
-    meta->free = 1;
+void *my_malloc(size_t size) {
+    /* Si la taille dépasse la taille maximale d'un objet allouable avec l'alignement derrière */
+    if(size > 0x8000000000000000 - ALIGNMENT) return NULL;
+    /* Permet d'aligner la taille sur 8 ou 4 octets, et permet d'allouer au minimum 8 ou 4 octets pour une taille nulle */
+    size = (size == 0) ? ALIGN(1) : ALIGN(size);
 
-    // Fusionner les blocs libres consécutifs pour éviter la fragmentation
-    block_meta_t *current = meta_pool;
-    while (current) {
-        // Si le bloc courant et le bloc suivant sont tous deux libres, les fusionner
-        if (current->free && current->next && current->next->free) {
-            // Ajouter la taille du descripteur suivant et du bloc suivant au bloc courant
-            current->size += sizeof(block_meta_t) + current->next->size;
-            // Faire pointer le bloc courant vers le bloc suivant du bloc fusionné
-            current->next = current->next->next;
+    /* Si le top_chunk n'a jamais été crée, alors le créer.
+     Cela signifie que c'est le tout premier malloc du programme */
+    if (topchunk_pool == NULL) {
+        init_pools();
+    }
+
+    if(topchunk_pool->current_size_metadata + 2 * ALIGN(sizeof(metadata)) > topchunk_pool->total_size_metadata)
+    {
+        /* on demande + de mémoire pour meta_pool avec mremap dans le cas extrême de 2 allocs pour fragmentation de data */
+        get_more_memory_mmap_metadata();
+    }
+
+    if(topchunk_pool->current_size_data + ALIGN(sizeof(size_t)) + size > topchunk_pool->total_size_data)
+    {
+        /* on demande + de mémoire pour data_pool avec mremap */
+        get_more_memory_mmap_data(size);
+    }
+
+    size_t *freed_block = verify_freed_block(size);
+    if(freed_block != NULL)
+    {
+        return freed_block;
+    }
+
+    /* Ajout du metadata à la fin de la liste */
+    metadata *new_meta = (metadata*)((size_t)meta_pool + topchunk_pool->current_size_metadata);
+    /* TODO : canary */
+    new_meta->canary_chunk = get_random_canary();
+    new_meta->canary = get_random_canary();
+    new_meta->chunk = data_pool + topchunk_pool->current_size_data;
+    new_meta->free = MY_IS_BUSY;
+    new_meta->next = NULL;
+    new_meta->next_waiting = NULL;
+    new_meta->size_of_chunk = size; /* data sans le canary */
+    topchunk_pool->current_size_data += size + ALIGN(sizeof(size_t));
+
+    /* Si au moins un élément est déjà alloué, mettre le nouveau meta alloué à la suite */
+    if(topchunk_pool->metadata_allocated != NULL)
+    {
+        metadata *n = topchunk_pool->metadata_allocated;
+        while(n->next != NULL){n = n->next;}
+        n->next = new_meta;
+    }
+    else
+    {
+        /* Si aucun élément n'a été alloué depuis */
+        topchunk_pool->metadata_allocated = new_meta;
+    }
+
+    topchunk_pool->current_size_metadata += ALIGN(sizeof(metadata));
+    topchunk_pool->number_of_elements_allocated++;
+    // TODO : canary
+    // size_t *chunk = new_meta->chunk;
+    // chunk[new_meta->size_of_chunk] = (size_t)0xaabbccddddccbbaa;
+    size_t *canary = (size_t*)((size_t)new_meta->chunk + new_meta->size_of_chunk);
+    
+    *canary = get_random_canary();
+    logfile("[+] %zu bytes allocated @ %p\n",size,new_meta->chunk);
+
+    return new_meta->chunk;
+}
+
+unsigned char find_element_to_free(void *ptr)
+{
+    metadata *current_meta = topchunk_pool->metadata_allocated;
+    void *current_chunk;
+
+    /* Pour chaque élément indépendamment de l'ordre, on regarde s'il existe un meta déjà libéré */
+    while(current_meta != NULL)
+    {
+        //current_meta = (metadata*)((size_t)meta_pool + i*ALIGN(sizeof(metadata))); 
+        current_chunk = current_meta->chunk;
+        
+        if(current_chunk == ptr)
+        {
+            /* Si le bloc était occupé il devient libre */
+            current_meta->free = MY_IS_FREE;
+
+            /* Ajouter à la taille du bloc free le canary de fin */
+            current_meta->size_of_chunk += ALIGN(sizeof(size_t));
+
+            /* Si au moins un élément est déjà libéré, mettre le nouveau meta libéré à la suite */
+            if(topchunk_pool->free_metadata != NULL)
+            {
+                /* Si au moins un élément est libéré, faire suivre la meta */
+                metadata *n = topchunk_pool->free_metadata;
+                while(n->next_waiting != NULL){n = n->next_waiting;}
+                n->next_waiting = current_meta;
+            }
+            else
+            {
+                /* Si aucun élément n'est libéré, alors initialiser la liste */
+                topchunk_pool->free_metadata = current_meta;
+            }
+            current_meta->next_waiting = NULL;
+            if(topchunk_pool->metadata_allocated != NULL)
+            {
+                /* Si au moins un élément est alloué, supprimer le bloc de la liste et passer à son suivant */
+                metadata *_ = topchunk_pool->metadata_allocated;
+                metadata *previous = NULL;
+                while(_ != NULL)
+                {
+                    if(_->next == current_meta)   
+                    {
+                        previous = _;
+                        break;
+                    }
+                    _ = _->next;
+                }
+                /* Si le bloc avait un suivant alors raccrocher son précédent avec son suivant pour l'enlever de la liste des éléments alloués */
+                if(previous != NULL)
+                {
+                    /* Le bloc avait un meta alloué précédent */
+                    if(current_meta->next != NULL)
+                    {
+                        /* Le bloc avait un meta alloué suivant et précédent */
+                        metadata *next_one = current_meta->next;
+                        previous->next = next_one;
+                    }
+                    else
+                    {
+                        /* Le bloc n'avait qu'un meta alloué précédent */
+                        topchunk_pool->metadata_allocated = previous;
+                        topchunk_pool->metadata_allocated->next = NULL;
+                    }
+                }
+                else
+                {
+                    /* Le bloc n'avait pas de meta alloué précédent */
+                    if(current_meta->next != NULL)
+                    {
+                        /* Le bloc n'avait qu'un meta alloué suivant */
+                        metadata *next_one = current_meta->next;
+                        topchunk_pool->metadata_allocated = next_one;
+                        next_one->next = NULL;
+                    }
+                    else
+                    {
+                        /* Le bloc n'avait ni de meta alloué suivant ni précédent */
+                        topchunk_pool->metadata_allocated = NULL;
+                    }
+                }
+            }
+            topchunk_pool->number_of_elements_allocated--;
+            topchunk_pool->number_of_elements_freed++;
+            return 1;
         }
-        // Passer au descripteur de bloc suivant
-        current = current->next;
+    current_meta = current_meta->next;
+    }
+    /* Not found or double free */
+    metadata *_ = topchunk_pool->free_metadata;
+    while(_ != NULL)
+    {
+        if(_->chunk == ptr)
+        {
+            return 2;
+        }
+        _ = _->next_waiting;
+    }
+    return 0;
+}
+
+void my_free(void *ptr) {
+    /* Pas de free(NULL) possible */
+    if(ptr == NULL)
+    {
+        /* On tente de free NULL */
+        return;
+    }
+    if(topchunk_pool == NULL)
+    {
+        /* On tente de free alors que rien n'a été alloué */
+        return;
+    }
+
+    unsigned char found = find_element_to_free(ptr);
+    switch(found)
+    {
+        case 0:
+            /* not found */
+            logfile("??? %p is not found in allocated chunks ???\n",ptr);
+            break;
+        case 1:
+            /* found */
+            logfile("[+] Memory @ %p successfully freed.\n",ptr);
+            break;
+        case 2:
+            /* double free ! */
+            logfile("!!! VULN !!! : Double free detected for %p pointer\n",ptr);
+            exit(1);
+            break;
     }
 }
 
-
-// Fonction calloc sécurisée pour allouer et initialiser de la mémoire
 void *my_calloc(size_t nmemb, size_t size) {
-    // Calculer la taille totale à allouer
-    size_t total_size = nmemb * size;
-    // Utiliser my_malloc pour allouer la mémoire
-    void *ptr = my_malloc(total_size);
-    // Si l'allocation réussit, initialiser la mémoire allouée à zéro
-    if (ptr) {
-        memset(ptr, 0, total_size);
+    size_t *ptr = NULL;
+    if(nmemb == 0 || size == 0)
+    {
+        ptr = my_malloc(ALIGNMENT);
+        memset(ptr,0,nmemb * size);
+        return ptr;
     }
-    // Retourner le pointeur vers la mémoire allouée et initialisée
+
+    ptr = my_malloc(nmemb * size);
+    memset(ptr,0,nmemb * size);
+    logfile("[+] %zu bytes set to 0 @ %p\n",nmemb * size,ptr);
     return ptr;
 }
 
-
-// Fonction realloc sécurisée pour redimensionner un bloc de mémoire alloué
 void *my_realloc(void *ptr, size_t size) {
-    // Si le pointeur est NULL, allouer un nouveau bloc de mémoire
-    if (!ptr) return my_malloc(size);
-    // Si la taille est zéro, libérer le bloc de mémoire et retourner NULL
-    if (size == 0) {
+    if(ptr != NULL && size == 0)
+    {
         my_free(ptr);
         return NULL;
     }
 
-    // Obtenir le descripteur de bloc correspondant au bloc de données
-    block_meta_t *meta = (block_meta_t *)((char *)ptr - sizeof(block_meta_t));
-    // Si la taille actuelle du bloc est suffisante, retourner le même pointeur
-    if (meta->size >= size) {
-        return ptr;
+    void *final = my_malloc(size);
+    
+    /* On parcourt l'ensemble des meta alloués 
+            Si la meta parcourue pointe vers un chunk identique à celui de ptr alors copier données */
+    metadata *_ = topchunk_pool->metadata_allocated;
+    while(_ != NULL)
+    {
+        if(_->chunk == ptr)
+        {
+            /* Comme dans le manuel, la mémoire ajoutée en + n'est pas initialisée */
+            memcpy(final,_->chunk,_->size_of_chunk);
+            goto END_MY_REALLOC;
+        }
+        _ = _->next;
     }
 
-    // Allouer un nouveau bloc de mémoire avec la nouvelle taille
-    void *new_ptr = my_malloc(size);
-    // Si l'allocation réussit, copier les données de l'ancien bloc vers le nouveau
-    if (new_ptr) {
-        memcpy(new_ptr, ptr, meta->size);
-        // Libérer l'ancien bloc de mémoire
-        my_free(ptr);
-    }
-    // Retourner le pointeur vers le nouveau bloc de mémoire
-    return new_ptr;
+END_MY_REALLOC:
+    /* Libérer le chunk qui a été relogé */
+    my_free(ptr);
+
+    return final;
 }
 
 // Fonctions pour bibliothèque dynamique
 #ifdef DYNAMIC
+__attribute__((visibility("default")))
 void *malloc(size_t size) {
     return my_malloc(size);
 }
 
+__attribute__((visibility("default")))
 void free(void *ptr) {
     my_free(ptr);
 }
 
+__attribute__((visibility("default")))
 void *calloc(size_t nmemb, size_t size) {
     return my_calloc(nmemb, size);
 }
 
+__attribute__((visibility("default")))
 void *realloc(void *ptr, size_t size) {
     return my_realloc(ptr, size);
 }
