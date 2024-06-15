@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <fcntl.h>
 
 /* Directives de préprocesseur pour l'alignement sur 8 octets / 4 octets selon l'architecture */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(__ppc64__)
@@ -24,10 +25,10 @@
 metadata *meta_pool = NULL;
 topchunk *topchunk_pool = NULL;
 void *data_pool = NULL;
-FILE *report_file = NULL;
+int report_file = -1;
 
 void logfile(const char *format, ...) {
-    if(report_file == NULL) return;
+    if(report_file == -1) return;
 
     va_list args;
     va_start(args, format);
@@ -51,38 +52,45 @@ void logfile(const char *format, ...) {
 
     vsnprintf(message, size + 1, format, args);
 
-    size_t written = fwrite(message, 1, size, report_file);
-    if (written < (size_t)size) {
-        perror("Error fwrite");
+    if (write(report_file, message, size) != size) {
+        perror("Error write");
     }
 
     va_end(args);
-    fflush(report_file);
 }
 
 __attribute__((constructor))
 void initialize_report() {
     const char *filename = getenv("MSM_OUTPUT");
     if (filename != NULL) {
-        report_file = fopen(filename, "w");
-        if (report_file == NULL) {
+        report_file = open("logs.log", O_WRONLY | O_CREAT, 0644);
+        if (report_file == -1) {
             perror("Failed to open report file");
             exit(EXIT_FAILURE);
-        } else {
-            fflush(report_file);
         }
     }
 }
 
 __attribute__((destructor))
 void close_report() {
-    if (report_file != NULL) {
-        fclose(report_file);
+    if(report_file != -1)
+    {
+        close(report_file);
     }
 }
 
 static void init_pools(void) {
     /* Construction du top_chunk */
+
+    /* report_file utilise fopen, qui utilise malloc ! 
+        puisque le malloc initialise le topchunk_pool et la meta_pool, FILE sera mappé dans ces eaux là...
+        apparemment le malloc du fopen alloue 0x1d8 octets.
+        On réseve 4 Ko octets quelque part pour FILE.*/
+
+    if(report_file == -1)
+    {
+
+    }
 
     /* On commence la liste des metadata 40 Mo après l'adresse nulle en croisant les doigts */
     topchunk_pool = mmap((size_t*)(MY_PAGE_SIZE * 10000), INITIAL_MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -418,6 +426,8 @@ void get_more_memory_mmap_data(size_t size)
 }
 
 void *my_malloc(size_t size) {
+    /* Si la taille dépasse la taille maximale d'un objet allouable avec l'alignement derrière */
+    if(size > 0x8000000000000000 - ALIGNMENT) return NULL;
     /* Permet d'aligner la taille sur 8 ou 4 octets, et permet d'allouer au minimum 8 ou 4 octets pour une taille nulle */
     size = (size == 0) ? ALIGN(1) : ALIGN(size);
 
@@ -637,12 +647,27 @@ void *my_realloc(void *ptr, size_t size) {
         return NULL;
     }
 
-    /* Libérer le chunk et le reloger */
+    void *final = my_malloc(size);
+    
+    /* On parcourt l'ensemble des meta alloués 
+            Si la meta parcourue pointe vers un chunk identique à celui de ptr alors copier données */
+    metadata *_ = topchunk_pool->metadata_allocated;
+    while(_ != NULL)
+    {
+        if(_->chunk == ptr)
+        {
+            /* Comme dans le manuel, la mémoire ajoutée en + n'est pas initialisée */
+            memcpy(final,_->chunk,_->size_of_chunk);
+            goto END_MY_REALLOC;
+        }
+        _ = _->next;
+    }
+
+END_MY_REALLOC:
+    /* Libérer le chunk qui a été relogé */
     my_free(ptr);
 
-    if(ptr == NULL) return my_malloc(size);
-    if(size == 0) return my_malloc(0);
-    return my_malloc(size);
+    return final;
 }
 
 // Fonctions pour bibliothèque dynamique
