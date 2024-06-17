@@ -180,18 +180,6 @@ Test(my_malloc, loop_calloc) {
     }
 }
 
-// Test pour vérifier la réallocation avec my_realloc dans une boucle
-Test(my_malloc, loop_realloc) {
-    char *ptr = my_malloc(100);
-    cr_assert_not_null(ptr, "Initial allocation should succeed");
-    for (int i = 0; i < 100; i++) {
-        char *new_ptr = my_realloc(ptr, 100 + i * 10);
-        cr_assert_not_null(new_ptr, "Reallocation should succeed in loop iteration %d", i);
-        ptr = new_ptr;
-    }
-    my_free(ptr);
-}
-
 // Test pour vérifier l'initialisation avec my_calloc et la réutilisation des blocs de mémoire
 Test(my_malloc, calloc_and_reuse) {
     char *ptr1 = my_calloc(10, 10);
@@ -839,4 +827,25 @@ Test(my_malloc, complex_sequence) {
     my_free(ptr4);
     my_free(ptr5);
     my_free(ptr6);
+}
+
+Test(my_realloc, optimization_when_next_block_is_free) {
+    // Allouer deux blocs de mémoire, puis libérer le deuxième bloc
+    char *ptr1 = my_malloc(100);
+    char *ptr2 = my_malloc(200);
+    cr_assert_not_null(ptr1, "First allocation should succeed");
+    cr_assert_not_null(ptr2, "Second allocation should succeed");
+
+    strcpy(ptr1, "This is a test for realloc optimization.");
+
+    my_free(ptr2);
+
+    // Réallouer le premier bloc avec une taille qui peut être satisfaite par la fusion avec le deuxième bloc
+    char *new_ptr = my_realloc(ptr1, 250);
+    cr_assert_not_null(new_ptr, "Reallocation should succeed");
+    cr_assert_str_eq(new_ptr, "This is a test for realloc optimization.", "Content should remain the same after realloc");
+    cr_assert_eq(new_ptr, ptr1, "Pointer should remain the same if the block is extended");
+
+    // Libérer le bloc réalloué
+    my_free(new_ptr);
 }

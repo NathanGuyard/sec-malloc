@@ -737,34 +737,112 @@ void *my_calloc(size_t nmemb, size_t size) {
     return ptr;
 }
 
+// void *my_realloc(void *ptr, size_t size) {
+//     if(ptr == NULL) {
+//         return my_malloc(size);
+//     }
+
+//     if(size == 0) {
+//         my_free(ptr);
+//         return NULL;
+//     }
+
+//     metadata *current_meta = topchunk_pool->metadata_allocated;
+
+//     // Rechercher le meta correspondant au pointeur fourni
+//     while(current_meta != NULL) {
+//         if(current_meta->chunk == ptr) {
+//             break;
+//         }
+//         current_meta = current_meta->next;
+//     }
+
+//     if(current_meta == NULL) {
+//         // Pointeur non trouvé
+//         return NULL;
+//     }
+
+//     // Vérifier si le bloc suivant est libre et de taille suffisante
+//     metadata *next_meta = current_meta->next;
+//     if(next_meta != NULL && next_meta->free == MY_IS_FREE && (current_meta->size_of_chunk + next_meta->size_of_chunk + ALIGN(sizeof(size_t)) >= size)) {
+//         // Fusionner les blocs
+//         current_meta->size_of_chunk += next_meta->size_of_chunk + ALIGN(sizeof(size_t));
+
+//         // Mettre à jour les liens
+//         current_meta->next = next_meta->next;
+//         if(next_meta->next != NULL) {
+//             next_meta->next->next_waiting = current_meta;
+//         }
+
+//         topchunk_pool->number_of_elements_freed--;
+
+//         // Retourner le même pointeur puisque le bloc a été étendu
+//         return ptr;
+//     } else {
+//         // Si la fusion n'est pas possible, allouer un nouveau bloc et copier les données
+//         void *new_ptr = my_malloc(size);
+//         if(new_ptr != NULL) {
+//             memcpy(new_ptr, ptr, current_meta->size_of_chunk);
+//             my_free(ptr);
+//         }
+//         return new_ptr;
+//     }
+// }
+
 void *my_realloc(void *ptr, size_t size) {
-    if(ptr != NULL && size == 0)
-    {
+    if(ptr == NULL) {
+        return my_malloc(size);
+    }
+
+    if(size == 0) {
         my_free(ptr);
         return NULL;
     }
 
-    void *final = my_malloc(size);
-    
-    /* On parcourt l'ensemble des meta alloués 
-            Si la meta parcourue pointe vers un chunk identique à celui de ptr alors copier données */
-    metadata *_ = topchunk_pool->metadata_allocated;
-    while(_ != NULL)
-    {
-        if(_->chunk == ptr)
-        {
-            /* Comme dans le manuel, la mémoire ajoutée en + n'est pas initialisée */
-            memcpy(final,_->chunk,_->size_of_chunk);
-            goto END_MY_REALLOC;
+    metadata *current_meta = topchunk_pool->metadata_allocated;
+
+    // Rechercher le meta correspondant au pointeur fourni
+    while(current_meta != NULL) {
+        if(current_meta->chunk == ptr) {
+            break;
         }
-        _ = _->next;
+        current_meta = current_meta->next;
     }
 
-END_MY_REALLOC:
-    /* Libérer le chunk qui a été relogé */
-    my_free(ptr);
+    if(current_meta == NULL) {
+        // Pointeur non trouvé
+        return NULL;
+    }
 
-    return final;
+    // Vérifier si le bloc suivant est libre et de taille suffisante
+    metadata *next_meta = (metadata*)((size_t)current_meta + ALIGN(sizeof(metadata)));
+    if(next_meta != NULL && next_meta->free == MY_IS_FREE && (current_meta->size_of_chunk + next_meta->size_of_chunk + ALIGN(sizeof(size_t)) >= size)) {
+        // Fusionner les blocs
+        current_meta->size_of_chunk += next_meta->size_of_chunk;
+
+        // Mettre à jour les liens
+        current_meta->next_waiting = next_meta->next_waiting;
+        if(next_meta->next_waiting != NULL) {
+            next_meta->next_waiting->next_waiting = current_meta;
+        }
+
+        topchunk_pool->number_of_elements_freed--;
+
+        // Mettre à jour le canary du bloc fusionné
+        current_meta->canary_chunk = get_random_canary();
+        size_t *canary = (size_t*)((size_t)current_meta->chunk + current_meta->size_of_chunk);
+        *canary = current_meta->canary_chunk;
+
+        return ptr;
+    } else {
+        // Si la fusion n'est pas possible, allouer un nouveau bloc et copier les données
+        void *new_ptr = my_malloc(size);
+        if(new_ptr != NULL) {
+            memcpy(new_ptr, ptr, current_meta->size_of_chunk);
+            my_free(ptr);
+        }
+        return new_ptr;
+    }
 }
 
 // Fonctions pour bibliothèque dynamique
